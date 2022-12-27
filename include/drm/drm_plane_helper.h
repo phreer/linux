@@ -43,6 +43,8 @@ int drm_plane_helper_disable_primary(struct drm_plane *plane,
 void drm_plane_helper_destroy(struct drm_plane *plane);
 int drm_plane_helper_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state);
 
+#define DRM_PLANE_HELPER_NO_SCALING (1<<16)
+
 /**
  * DRM_PLANE_NON_ATOMIC_FUNCS - Default plane functions for non-atomic drivers
  *

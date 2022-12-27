@@ -46,11 +46,12 @@ static int virtio_gpu_modeset = -1;
 MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
 module_param_named(modeset, virtio_gpu_modeset, int, 0400);
 
-static int virtio_gpu_pci_quirk(struct drm_device *dev)
+static int virtio_gpu_pci_quirk(struct drm_device *dev, struct virtio_device *vdev)
 {
-	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct pci_dev *pdev = to_pci_dev(vdev->dev.parent);
 	const char *pname = dev_name(&pdev->dev);
 	bool vga = (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA;
+	char unique[20];
 	int ret;
 
 	DRM_INFO("pci: %s detected at %s\n",
@@ -62,7 +63,39 @@ static int virtio_gpu_pci_quirk(struct drm_device *dev)
 			return ret;
 	}
 
-	return 0;
+	/*
+	 * Normally the drm_dev_set_unique() call is done by core DRM.
+	 * The following comment covers, why virtio cannot rely on it.
+	 *
+	 * Unlike the other virtual GPU drivers, virtio abstracts the
+	 * underlying bus type by using struct virtio_device.
+	 *
+	 * Hence the dev_is_pci() check, used in core DRM, will fail
+	 * and the unique returned will be the virtio_device "virtio0",
+	 * while a "pci:..." one is required.
+	 *
+	 * A few other ideas were considered:
+	 * - Extend the dev_is_pci() check [in drm_set_busid] to
+	 *   consider virtio.
+	 *   Seems like a bigger hack than what we have already.
+	 *
+	 * - Point drm_device::dev to the parent of the virtio_device
+	 *   Semantic changes:
+	 *   * Using the wrong device for i2c, framebuffer_alloc and
+	 *     prime import.
+	 *   Visual changes:
+	 *   * Helpers such as DRM_DEV_ERROR, dev_info, drm_printer,
+	 *     will print the wrong information.
+	 *
+	 * We could address the latter issues, by introducing
+	 * drm_device::bus_dev, ... which would be used solely for this.
+	 *
+	 * So for the moment keep things as-is, with a bulky comment
+	 * for the next person who feels like removing this
+	 * drm_dev_set_unique() quirk.
+	 */
+	snprintf(unique, sizeof(unique), "pci:%s", pname);
+	return drm_dev_set_unique(dev, unique);
 }
 
 static int virtio_gpu_probe(struct virtio_device *vdev)
@@ -76,24 +109,18 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
 	if (virtio_gpu_modeset == 0)
 		return -EINVAL;
 
-	/*
-	 * The virtio-gpu device is a virtual device that doesn't have DMA
-	 * ops assigned to it, nor DMA mask set and etc. Its parent device
-	 * is actual GPU device we want to use it for the DRM's device in
-	 * order to benefit from using generic DRM APIs.
-	 */
-	dev = drm_dev_alloc(&driver, vdev->dev.parent);
+	dev = drm_dev_alloc(&driver, &vdev->dev);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
 	vdev->priv = dev;
 
-	if (dev_is_pci(vdev->dev.parent)) {
-		ret = virtio_gpu_pci_quirk(dev);
+	if (!strcmp(vdev->dev.parent->bus->name, "pci")) {
+		ret = virtio_gpu_pci_quirk(dev, vdev);
 		if (ret)
 			goto err_free;
 	}
 
-	ret = virtio_gpu_init(vdev, dev);
+	ret = virtio_gpu_init(dev);
 	if (ret)
 		goto err_free;
 
@@ -148,59 +175,6 @@ static unsigned int features[] = {
 	VIRTIO_GPU_F_RESOURCE_BLOB,
 	VIRTIO_GPU_F_CONTEXT_INIT,
 };
-
-#ifdef CONFIG_PM_SLEEP
-static int virtgpu_freeze(struct virtio_device *vdev)
-{
-	struct drm_device *dev = vdev->priv;
-	struct virtio_gpu_device *vgdev = dev->dev_private;
-	int error;
-
-	error = drm_mode_config_helper_suspend(dev);
-	if (error) {
-		DRM_ERROR("suspend error %d\n", error);
-		return error;
-	}
-
-	flush_work(&vgdev->obj_free_work);
-	flush_work(&vgdev->ctrlq.dequeue_work);
-	flush_work(&vgdev->cursorq.dequeue_work);
-	flush_work(&vgdev->config_changed_work);
-	vdev->config->del_vqs(vdev);
-
-	return 0;
-}
-
-static int virtgpu_restore(struct virtio_device *vdev)
-{
-	struct drm_device *dev = vdev->priv;
-	struct virtio_gpu_device *vgdev = dev->dev_private;
-	int error;
-
-	error = virtio_gpu_find_vqs(vgdev);
-	if (error) {
-		DRM_ERROR("failed to find virt queues\n");
-		return error;
-	}
-
-	virtio_device_ready(vdev);
-
-	error = virtio_gpu_object_restore_all(vgdev);
-	if (error) {
-		DRM_ERROR("Failed to recover objects\n");
-		return error;
-	}
-
-	error = drm_mode_config_helper_resume(dev);
-	if (error) {
-		DRM_ERROR("resume error %d\n", error);
-		return error;
-	}
-
-	return 0;
-}
-#endif
-
 static struct virtio_driver virtio_gpu_driver = {
 	.feature_table = features,
 	.feature_table_size = ARRAY_SIZE(features),
@@ -209,11 +183,7 @@ static struct virtio_driver virtio_gpu_driver = {
 	.id_table = id_table,
 	.probe = virtio_gpu_probe,
 	.remove = virtio_gpu_remove,
-	.config_changed = virtio_gpu_config_changed,
-#ifdef CONFIG_PM_SLEEP
-	.freeze = virtgpu_freeze,
-	.restore = virtgpu_restore,
-#endif
+	.config_changed = virtio_gpu_config_changed
 };
 
 module_virtio_driver(virtio_gpu_driver);

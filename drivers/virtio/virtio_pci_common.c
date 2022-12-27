@@ -546,6 +546,8 @@ static int virtio_pci_probe(struct pci_dev *pci_dev,
 			goto err_probe;
 	}
 
+	vp_dev->vdev.dev.dma_mask = &vp_dev->pci_dev->dma_mask;
+
 	pci_set_master(pci_dev);
 
 	rc = register_virtio_device(&vp_dev->vdev);
